@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
 """
-Unified Binance Futures Backtest + Telegram Notifier (Paper Mode)
+Unified Binance Futures Trend-Pullback Backtester + Telegram Notifier
+=====================================================================
 
-Merges capabilities previously split across multiple scripts into one:
-- Binance Futures data acquisition
-- Trend Pullback backtesting
-- Fee-aware PnL/account simulation
-- Telegram trade/summary notifications
+This is a paper-trading/backtesting script (NO live order placement).
+It combines:
+1) Futures data acquisition from Binance REST API
+2) Trend Pullback strategy simulation
+3) Fee-aware PnL/accounting + CSV trade logs
+4) Telegram notifications per closed trade + final summary
 
-This script is backtest/paper only. It never places live orders.
+Major defaults preserved from previous scripts:
+- Symbol: BTCUSDT
+- Interval: 1h
+- EMA fast/trend: 20 / 50
+- RSI: 14 (optional filter, enabled by default)
+- ATR: 14
+- Volume MA: 20
+- ATR stop/take-profit: 1x ATR / 1.5x ATR
+- Initial balance: 100 USD
+- Trade allocation: 90 USD per trade
+- Commission: 0.04% per side (fee_rate=0.0004)
 """
 
 from __future__ import annotations
@@ -28,53 +40,62 @@ import requests
 from requests import Response
 from requests.exceptions import RequestException, Timeout
 
+# Optional local .env support
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover
     load_dotenv = None
 
+# -----------------------------
+# API constants and HTTP policy
+# -----------------------------
 FUTURES_BASE = "https://fapi.binance.com"
 KLINES_ENDPOINT = "/fapi/v1/klines"
 BOOK_TICKER_ENDPOINT = "/fapi/v1/ticker/bookTicker"
 
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
-REQUEST_TIMEOUT = (5, 15)
+REQUEST_TIMEOUT = (5, 15)  # connect, read
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 20.0
 JITTER_MAX = 0.5
 
 
+# -----------------------------
+# Data models
+# -----------------------------
 @dataclass
 class Config:
+    # Market/data
     symbol: str = "BTCUSDT"
     interval: str = "1h"
     limit: int = 500
     start_time_ms: int | None = None
     end_time_ms: int | None = None
 
-    # Preserve strategy/risk defaults from previous scripts
-    initial_balance: float = 100.0
-    position_size_pct: float = 0.9
-    fee_rate: float = 0.0004
-
+    # Strategy defaults (preserved)
     ema_fast: int = 20
     ema_trend: int = 50
     rsi_period: int = 14
     atr_period: int = 14
     volume_ma_period: int = 20
-
     use_rsi_filter: bool = True
     rsi_threshold: float = 50.0
     max_spread: float = 2.0
 
+    # Exits
     atr_sl_mult: float = 1.0
     rr_ratio: float = 1.5
     use_trailing_stop: bool = False
     trailing_atr_mult: float = 1.0
 
+    # Account/risk
+    initial_balance: float = 100.0
+    trade_size_usd: float = 90.0
+    fee_rate: float = 0.0004  # 0.04% per side
     max_concurrent_positions: int = 1
 
+    # Output/notifications
     output_csv: str = "backtest_results.csv"
     send_telegram: bool = True
 
@@ -92,7 +113,7 @@ class Candle:
 
 @dataclass
 class Position:
-    direction: str
+    direction: str  # LONG | SHORT
     entry_time: int
     entry_price: float
     qty: float
@@ -108,12 +129,15 @@ class Trade:
     position_size: float
     direction: str
     gross_pnl: float
-    commission_paid: float
+    fees: float
     net_pnl: float
-    account_balance: float
+    balance: float
     exit_reason: str
 
 
+# -----------------------------
+# Configuration and logging
+# -----------------------------
 def setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -153,9 +177,6 @@ def load_env_config() -> Config:
         limit=env_int("LIMIT", 500),
         start_time_ms=int(os.getenv("START_TIME_MS")) if os.getenv("START_TIME_MS") else None,
         end_time_ms=int(os.getenv("END_TIME_MS")) if os.getenv("END_TIME_MS") else None,
-        initial_balance=env_float("INITIAL_BALANCE", 100.0),
-        position_size_pct=env_float("POSITION_SIZE_PCT", 0.9),
-        fee_rate=env_float("FEE_RATE", 0.0004),
         ema_fast=env_int("EMA_FAST", 20),
         ema_trend=env_int("EMA_TREND", 50),
         rsi_period=env_int("RSI_PERIOD", 14),
@@ -168,6 +189,9 @@ def load_env_config() -> Config:
         rr_ratio=env_float("RR_RATIO", 1.5),
         use_trailing_stop=parse_bool(os.getenv("USE_TRAILING_STOP"), False),
         trailing_atr_mult=env_float("TRAILING_ATR_MULT", 1.0),
+        initial_balance=env_float("INITIAL_BALANCE", 100.0),
+        trade_size_usd=env_float("TRADE_SIZE_USD", 90.0),
+        fee_rate=env_float("FEE_RATE", 0.0004),
         max_concurrent_positions=env_int("MAX_CONCURRENT_POSITIONS", 1),
         output_csv=os.getenv("OUTPUT_CSV", "backtest_results.csv"),
         send_telegram=parse_bool(os.getenv("SEND_TELEGRAM"), True),
@@ -195,10 +219,12 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("limit must be >= 120")
     if cfg.initial_balance <= 0:
         raise ValueError("initial_balance must be > 0")
-    if not (0 < cfg.position_size_pct <= 1):
-        raise ValueError("position_size_pct must be in (0,1]")
+    if cfg.trade_size_usd <= 0:
+        raise ValueError("trade_size_usd must be > 0")
     if cfg.fee_rate < 0:
         raise ValueError("fee_rate must be >= 0")
+    if cfg.max_concurrent_positions <= 0:
+        raise ValueError("max_concurrent_positions must be > 0")
     if cfg.ema_fast <= 1 or cfg.ema_trend <= 1 or cfg.ema_fast >= cfg.ema_trend:
         raise ValueError("EMA settings invalid")
     if cfg.rsi_period <= 1 or cfg.atr_period <= 1 or cfg.volume_ma_period <= 1:
@@ -208,9 +234,16 @@ def validate_config(cfg: Config) -> None:
     if cfg.atr_sl_mult <= 0 or cfg.rr_ratio <= 0:
         raise ValueError("atr_sl_mult and rr_ratio must be > 0")
     if cfg.use_trailing_stop and cfg.trailing_atr_mult <= 0:
-        raise ValueError("trailing_atr_mult must be > 0 if trailing stop enabled")
-    if cfg.max_concurrent_positions <= 0:
-        raise ValueError("max_concurrent_positions must be > 0")
+        raise ValueError("trailing_atr_mult must be > 0 when trailing stop enabled")
+
+
+# -----------------------------
+# HTTP / API
+# -----------------------------
+def sleep_backoff(attempt: int) -> None:
+    delay = min(INITIAL_BACKOFF * (2 ** (attempt - 1)), MAX_BACKOFF) + random.uniform(0, JITTER_MAX)
+    logging.info("Retrying in %.2f sec", delay)
+    time.sleep(delay)
 
 
 def request_with_retry(
@@ -227,7 +260,13 @@ def request_with_retry(
             logging.info("HTTP %s %s params=%s", method, url, params)
             resp = session.request(method=method, url=url, params=params, json=json_payload, timeout=REQUEST_TIMEOUT)
             if resp.status_code in TRANSIENT_STATUSES:
-                logging.warning("Transient HTTP %s for %s (attempt %d/%d)", resp.status_code, url, attempt, MAX_RETRIES)
+                logging.warning(
+                    "Transient HTTP %s for %s (attempt %d/%d)",
+                    resp.status_code,
+                    url,
+                    attempt,
+                    MAX_RETRIES,
+                )
                 if attempt == MAX_RETRIES:
                     return resp
                 sleep_backoff(attempt)
@@ -242,13 +281,8 @@ def request_with_retry(
     raise RuntimeError(f"Request failed after {MAX_RETRIES} attempts: {url}") from last_exc
 
 
-def sleep_backoff(attempt: int) -> None:
-    delay = min(INITIAL_BACKOFF * (2 ** (attempt - 1)), MAX_BACKOFF) + random.uniform(0, JITTER_MAX)
-    logging.info("Retrying in %.2f sec", delay)
-    time.sleep(delay)
-
-
 def fetch_klines(session: requests.Session, cfg: Config) -> list[Candle]:
+    """Fetch historical futures candlesticks from /fapi/v1/klines."""
     url = FUTURES_BASE + KLINES_ENDPOINT
     candles: list[Candle] = []
     remaining = cfg.limit
@@ -268,7 +302,7 @@ def fetch_klines(session: requests.Session, cfg: Config) -> list[Candle]:
 
         payload = resp.json()
         if not isinstance(payload, list):
-            raise RuntimeError("Invalid kline payload")
+            raise RuntimeError("Invalid kline payload format")
         if not payload:
             break
 
@@ -284,6 +318,7 @@ def fetch_klines(session: requests.Session, cfg: Config) -> list[Candle]:
             )
             for x in payload
         ]
+
         candles.extend(parsed)
         remaining = cfg.limit - len(candles)
         if len(parsed) < chunk:
@@ -292,26 +327,32 @@ def fetch_klines(session: requests.Session, cfg: Config) -> list[Candle]:
 
     if not candles:
         raise RuntimeError("No futures candles returned")
-    logging.info("Fetched %d candles", len(candles))
+    logging.info("Fetched %d futures candles", len(candles))
     return candles[: cfg.limit]
 
 
 def fetch_spread(session: requests.Session, symbol: str) -> float:
+    """Fetch current futures spread from /fapi/v1/ticker/bookTicker."""
     url = FUTURES_BASE + BOOK_TICKER_ENDPOINT
     resp = request_with_retry(session, "GET", url, params={"symbol": symbol})
     if resp.status_code != 200:
         raise RuntimeError(f"BookTicker request failed: HTTP {resp.status_code} - {resp.text}")
+
     payload = resp.json()
     if not isinstance(payload, dict):
         raise RuntimeError("Invalid bookTicker payload")
+
     bid = float(payload["bidPrice"])
     ask = float(payload["askPrice"])
     spread = ask - bid
     if spread < 0:
-        raise RuntimeError(f"Negative spread: {spread}")
+        raise RuntimeError(f"Invalid negative spread: {spread}")
     return spread
 
 
+# -----------------------------
+# Indicators
+# -----------------------------
 def ema(values: list[float], period: int) -> list[float | None]:
     out: list[float | None] = [None] * len(values)
     if len(values) < period:
@@ -341,12 +382,14 @@ def rsi(values: list[float], period: int) -> list[float | None]:
     out: list[float | None] = [None] * len(values)
     if len(values) <= period:
         return out
+
     gains: list[float] = []
     losses: list[float] = []
     for i in range(1, period + 1):
         d = values[i] - values[i - 1]
         gains.append(max(d, 0.0))
         losses.append(max(-d, 0.0))
+
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
 
@@ -357,6 +400,7 @@ def rsi(values: list[float], period: int) -> list[float | None]:
         return 100.0 - (100.0 / (1 + rs))
 
     out[period] = calc(avg_gain, avg_loss)
+
     for i in range(period + 1, len(values)):
         d = values[i] - values[i - 1]
         gain = max(d, 0.0)
@@ -364,6 +408,7 @@ def rsi(values: list[float], period: int) -> list[float | None]:
         avg_gain = ((avg_gain * (period - 1)) + gain) / period
         avg_loss = ((avg_loss * (period - 1)) + loss) / period
         out[i] = calc(avg_gain, avg_loss)
+
     return out
 
 
@@ -371,6 +416,7 @@ def atr(candles: list[Candle], period: int) -> list[float | None]:
     out: list[float | None] = [None] * len(candles)
     if len(candles) <= period:
         return out
+
     trs: list[float] = []
     for i, c in enumerate(candles):
         if i == 0:
@@ -379,14 +425,19 @@ def atr(candles: list[Candle], period: int) -> list[float | None]:
             prev_close = candles[i - 1].close
             tr = max(c.high - c.low, abs(c.high - prev_close), abs(c.low - prev_close))
         trs.append(tr)
+
     prev = sum(trs[1 : period + 1]) / period
     out[period] = prev
     for i in range(period + 1, len(candles)):
         prev = ((prev * (period - 1)) + trs[i]) / period
         out[i] = prev
+
     return out
 
 
+# -----------------------------
+# Telegram + utility helpers
+# -----------------------------
 def telegram_credentials() -> tuple[str, str]:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -406,11 +457,11 @@ def send_telegram_message(session: requests.Session, text: str) -> None:
         raise RuntimeError(f"Telegram API error payload: {payload}")
 
 
-def ts(ms: int) -> str:
+def fmt_ts(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def calc_max_drawdown(equity: list[float]) -> float:
+def max_drawdown(equity: list[float]) -> float:
     if not equity:
         return 0.0
     peak = equity[0]
@@ -422,7 +473,7 @@ def calc_max_drawdown(equity: list[float]) -> float:
     return max_dd
 
 
-def save_csv(path: str, trades: list[Trade]) -> None:
+def write_trades_csv(path: str, trades: list[Trade]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(
@@ -433,7 +484,7 @@ def save_csv(path: str, trades: list[Trade]) -> None:
                 "position_size",
                 "trade_direction",
                 "gross_profit_loss",
-                "commission_paid",
+                "fees",
                 "net_profit_loss",
                 "account_balance",
                 "exit_reason",
@@ -442,21 +493,24 @@ def save_csv(path: str, trades: list[Trade]) -> None:
         for t in trades:
             w.writerow(
                 [
-                    ts(t.timestamp),
+                    fmt_ts(t.timestamp),
                     f"{t.entry_price:.8f}",
                     f"{t.exit_price:.8f}",
                     f"{t.position_size:.8f}",
                     t.direction,
                     f"{t.gross_pnl:.8f}",
-                    f"{t.commission_paid:.8f}",
+                    f"{t.fees:.8f}",
                     f"{t.net_pnl:.8f}",
-                    f"{t.account_balance:.8f}",
+                    f"{t.balance:.8f}",
                     t.exit_reason,
                 ]
             )
 
 
-def close_position(position: Position, candle: Candle, fee_rate: float, balance: float) -> tuple[Trade | None, float]:
+# -----------------------------
+# Backtest core logic
+# -----------------------------
+def evaluate_exit(position: Position, candle: Candle, fee_rate: float, balance: float) -> tuple[Trade | None, float]:
     exit_price = None
     reason = ""
 
@@ -484,16 +538,14 @@ def close_position(position: Position, candle: Candle, fee_rate: float, balance:
 
     entry_notional = position.entry_price * position.qty
     exit_notional = exit_price * position.qty
-    fee_entry = entry_notional * fee_rate
-    fee_exit = exit_notional * fee_rate
-    commission = fee_entry + fee_exit
+    fees = (entry_notional * fee_rate) + (exit_notional * fee_rate)
 
     gross = (
         (exit_price - position.entry_price) * position.qty
         if position.direction == "LONG"
         else (position.entry_price - exit_price) * position.qty
     )
-    net = gross - commission
+    net = gross - fees
     balance += net
 
     return (
@@ -504,9 +556,9 @@ def close_position(position: Position, candle: Candle, fee_rate: float, balance:
             position_size=position.qty,
             direction=position.direction.lower(),
             gross_pnl=gross,
-            commission_paid=commission,
+            fees=fees,
             net_pnl=net,
-            account_balance=balance,
+            balance=balance,
             exit_reason=reason,
         ),
         balance,
@@ -537,10 +589,11 @@ def run_backtest(session: requests.Session, cfg: Config) -> None:
         c = candles[i]
         prev = candles[i - 1]
 
+        # Spread check from futures book ticker
         try:
             spread_cache = fetch_spread(session, cfg.symbol)
         except Exception as exc:  # noqa: BLE001
-            logging.warning("Spread fetch failed at index=%d: %s", i, exc)
+            logging.warning("Spread fetch failed at i=%d: %s", i, exc)
             if spread_cache is None:
                 continue
 
@@ -554,8 +607,8 @@ def run_backtest(session: requests.Session, cfg: Config) -> None:
         if e20 is None or e50 is None or r is None or a is None or vma is None:
             continue
 
-        # exits
-        remaining_positions: list[Position] = []
+        # Manage existing open positions (trailing + exits)
+        still_open: list[Position] = []
         for p in open_positions:
             if cfg.use_trailing_stop:
                 if p.direction == "LONG":
@@ -563,22 +616,22 @@ def run_backtest(session: requests.Session, cfg: Config) -> None:
                 else:
                     p.stop_loss = min(p.stop_loss, c.close + (cfg.trailing_atr_mult * a))
 
-            trade, balance = close_position(p, c, cfg.fee_rate, balance)
+            trade, balance = evaluate_exit(p, c, cfg.fee_rate, balance)
             if trade is None:
-                remaining_positions.append(p)
+                still_open.append(p)
                 continue
 
             trades.append(trade)
             equity_curve.append(balance)
             logging.info(
-                "Trade closed dir=%s entry=%.4f exit=%.4f gross=%.4f fee=%.4f net=%.4f bal=%.4f",
+                "Closed %s entry=%.4f exit=%.4f gross=%.4f fees=%.4f net=%.4f bal=%.4f",
                 trade.direction,
                 trade.entry_price,
                 trade.exit_price,
                 trade.gross_pnl,
-                trade.commission_paid,
+                trade.fees,
                 trade.net_pnl,
-                trade.account_balance,
+                trade.balance,
             )
 
             if cfg.send_telegram:
@@ -591,29 +644,26 @@ def run_backtest(session: requests.Session, cfg: Config) -> None:
                             f"Direction: {trade.direction}\n"
                             f"Entry: {trade.entry_price:.4f}\n"
                             f"Exit: {trade.exit_price:.4f}\n"
-                            f"Gross PnL: {trade.gross_pnl:.4f} USD\n"
-                            f"Commission: {trade.commission_paid:.4f} USD\n"
-                            f"Net PnL: {trade.net_pnl:.4f} USD\n"
-                            f"Balance: {trade.account_balance:.4f} USD"
+                            f"Net P/L: {trade.net_pnl:.4f} USD\n"
+                            f"Balance: {trade.balance:.4f} USD"
                         ),
                     )
                 except Exception as exc:  # noqa: BLE001
                     logging.error("Telegram trade message failed: %s", exc)
 
-        open_positions = remaining_positions
+        open_positions = still_open
 
-        # filters
+        # Filters
         volume_ok = c.volume > vma
         spread_ok = spread <= cfg.max_spread
         logging.info(
-            "Filters index=%d volume_ok=%s spread_ok=%s volume=%.6f vma=%.6f spread=%.6f max_spread=%.6f",
+            "Filter check i=%d volume_ok=%s spread_ok=%s vol=%.6f vma=%.6f spread=%.6f",
             i,
             volume_ok,
             spread_ok,
             c.volume,
             vma,
             spread,
-            cfg.max_spread,
         )
 
         if len(open_positions) >= cfg.max_concurrent_positions:
@@ -621,11 +671,10 @@ def run_backtest(session: requests.Session, cfg: Config) -> None:
         if not volume_ok or not spread_ok:
             continue
 
-        # entry logic (preserved)
+        # Trend Pullback entries (preserved)
         long_trend = c.close > e50
         short_trend = c.close < e50
         prev_e20 = ema20[i - 1] if ema20[i - 1] is not None else e20
-
         long_trigger = prev.close <= prev_e20 and c.close > e20
         short_trigger = prev.close >= prev_e20 and c.close < e20
 
@@ -646,9 +695,9 @@ def run_backtest(session: requests.Session, cfg: Config) -> None:
             continue
 
         entry = c.close
-        # keep 90% sizing behavior from prior scripts (of current balance)
-        capital = balance * cfg.position_size_pct
-        qty = capital / entry if entry > 0 else 0
+        # Fixed 90 USD per trade (or whatever config says), capped by available balance.
+        notional = min(cfg.trade_size_usd, balance)
+        qty = notional / entry if entry > 0 else 0.0
         if qty <= 0:
             continue
 
@@ -669,27 +718,28 @@ def run_backtest(session: requests.Session, cfg: Config) -> None:
                 take_profit=take,
             )
         )
-        logging.info("Opened %s @ %.4f qty=%.6f sl=%.4f tp=%.4f", direction, entry, qty, stop, take)
+        logging.info("Opened %s entry=%.4f qty=%.6f sl=%.4f tp=%.4f", direction, entry, qty, stop, take)
 
-    save_csv(cfg.output_csv, trades)
+    write_trades_csv(cfg.output_csv, trades)
 
+    # Summary metrics
     total_trades = len(trades)
     wins = sum(1 for t in trades if t.net_pnl > 0)
-    win_rate = (wins / total_trades * 100) if total_trades else 0.0
+    win_rate = (wins / total_trades * 100.0) if total_trades else 0.0
     total_net = sum(t.net_pnl for t in trades)
     avg_return = (total_net / total_trades) if total_trades else 0.0
-    max_dd = calc_max_drawdown(equity_curve) * 100
+    max_dd = max_drawdown(equity_curve) * 100.0
     final_balance = balance
 
     summary = (
         "Backtest Summary\n"
         f"Symbol: {cfg.symbol}\n"
         f"Interval: {cfg.interval}\n"
-        f"Trades: {total_trades}\n"
-        f"Total Profit/Loss: {total_net:.4f} USD\n"
+        f"Total Trades: {total_trades}\n"
+        f"Total Net Profit/Loss: {total_net:.4f} USD\n"
         f"Win Rate: {win_rate:.2f}%\n"
         f"Average Return/Trade: {avg_return:.4f} USD\n"
-        f"Maximum Drawdown: {max_dd:.2f}%\n"
+        f"Max Drawdown: {max_dd:.2f}%\n"
         f"Final Account Balance: {final_balance:.4f} USD\n"
         f"CSV: {cfg.output_csv}"
     )
@@ -704,9 +754,12 @@ def run_backtest(session: requests.Session, cfg: Config) -> None:
             logging.error("Telegram summary failed: %s", exc)
 
 
+# -----------------------------
+# CLI entrypoint
+# -----------------------------
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Unified Binance Futures Trend Pullback backtester + Telegram")
-    parser.add_argument("--config", type=str)
+    parser = argparse.ArgumentParser(description="Unified Binance Futures Trend Pullback backtest + Telegram")
+    parser.add_argument("--config", type=str, help="Path to JSON config")
     parser.add_argument("--symbol", type=str)
     parser.add_argument("--interval", type=str)
     parser.add_argument("--limit", type=int)
@@ -714,6 +767,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end-time-ms", type=int)
     parser.add_argument("--max-spread", type=float)
     parser.add_argument("--fee-rate", type=float)
+    parser.add_argument("--trade-size-usd", type=float)
     parser.add_argument("--output-csv", type=str)
     parser.add_argument("--max-concurrent-positions", type=int)
     parser.add_argument("--no-telegram", action="store_true")
@@ -739,6 +793,8 @@ def build_config(args: argparse.Namespace) -> Config:
         cfg.max_spread = args.max_spread
     if args.fee_rate is not None:
         cfg.fee_rate = args.fee_rate
+    if args.trade_size_usd is not None:
+        cfg.trade_size_usd = args.trade_size_usd
     if args.output_csv:
         cfg.output_csv = args.output_csv
     if args.max_concurrent_positions is not None:
@@ -756,11 +812,12 @@ def main() -> int:
     try:
         cfg = build_config(parse_args())
         logging.info(
-            "Starting paper backtest symbol=%s interval=%s limit=%d fee=%.6f",
+            "Starting paper backtest symbol=%s interval=%s limit=%d fee=%.6f trade_size=%.2f",
             cfg.symbol,
             cfg.interval,
             cfg.limit,
             cfg.fee_rate,
+            cfg.trade_size_usd,
         )
         with requests.Session() as session:
             run_backtest(session, cfg)
